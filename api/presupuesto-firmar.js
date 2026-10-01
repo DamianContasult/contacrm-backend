@@ -72,8 +72,12 @@ module.exports = async (req, res) => {
             }
         }
 
-        const usuariosFacturacion = (await db.collection('usuarios').where('departamento', '==', 'Facturación').get())
-            .docs.map(d => ({ id: Number(d.id), ...d.data() }));
+        // El usuario solo guarda "departamento_id" (número) en Firestore; el nombre "Facturación"
+        // solo existe como texto en la colección "departamentos" — hay que resolverlo primero.
+        const departamentosSnap = await db.collection('departamentos').where('nombre', '==', 'Facturación').limit(1).get();
+        const usuariosFacturacion = departamentosSnap.empty ? [] : (
+            await db.collection('usuarios').where('departamento_id', '==', Number(departamentosSnap.docs[0].id)).get()
+        ).docs.map(d => ({ id: Number(d.id), ...d.data() }));
         for (const u of usuariosFacturacion) {
             const notifId = await siguienteId(db, 'notificaciones');
             await db.collection('notificaciones').doc(String(notifId)).set({
