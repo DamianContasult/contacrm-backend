@@ -1,0 +1,9 @@
+{
+  "name": "contacrm-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Funciones privilegiadas de ContaCRM que no pueden vivir en el navegador (gestionar contraseñas y cuentas de otros empleados).",
+  "dependencies": {
+    "firebase-admin": "^13.0.0"
+  }
+}
