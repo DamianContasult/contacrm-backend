@@ -6,11 +6,12 @@
    pasa por el backend con la Admin SDK — el "token" guardado en el propio
    presupuesto es lo único que protege la escritura.
 
-   Si queda al menos una línea aprobada: se da de alta al cliente (si no
-   lo estaba), se marca el paso "p5" del protocolo de alta, se arranca su
-   cuota mensual con las líneas mensuales aprobadas, y se avisa a
-   Facturación. Si no aprueba ninguna línea, el presupuesto queda como
-   "rechazado" sin tocar nada del cliente.
+   Importante: firmar NO da de alta al cliente ni arranca nada todavía.
+   El presupuesto queda en estado "firmado" (pendiente de revisión) — solo
+   cuando alguien de Facturación lo revisa y lo confirma desde el CRM
+   (Api.presupuestos.confirmarRevision) pasa a "aceptado" de verdad. Aquí
+   solo se guarda la respuesta del cliente y se avisa, por notificación y
+   por correo (con la firma adjunta), a quien lo creó y a Facturación.
    ========================================================= */
 const { iniciar, permitirCors } = require('./_firebase');
 
@@ -20,14 +21,56 @@ async function siguienteId(db, coleccion) {
     return Number(snap.docs[0].data().id) + 1;
 }
 
-async function marcarPasoProtocolo(db, clienteId, pasoId, notas) {
-    const ref = db.collection('clientes').doc(String(clienteId));
-    const doc = await ref.get();
-    if (!doc.exists) return;
-    const estado = doc.data().protocolo_alta || { activo: true, tipo: null, pasos: {}, fecha_inicio: new Date().toISOString() };
-    estado.pasos = estado.pasos || {};
-    estado.pasos[pasoId] = { completado: true, fecha: new Date().toISOString(), usuario_id: null, notas };
-    await ref.update({ protocolo_alta: estado });
+async function tokenGraphAppOnly() {
+    const resp = await fetch(`https://login.microsoftonline.com/${process.env.GRAPH_TENANT_ID}/oauth2/v2.0/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+            client_id: process.env.GRAPH_CLIENT_ID,
+            client_secret: process.env.GRAPH_CLIENT_SECRET,
+            scope: 'https://graph.microsoft.com/.default',
+            grant_type: 'client_credentials',
+        }),
+    });
+    const datos = await resp.json();
+    if (!resp.ok) throw new Error(datos.error_description || 'No se pudo autenticar con Microsoft Graph.');
+    return datos.access_token;
+}
+
+async function enviarCorreoConfirmacion({ destinatarios, cc, asunto, lineasHtml, totalAprobado, firmanteNombre, fechaFirma, firmaBase64 }) {
+    if (destinatarios.length === 0) return;
+    const token = await tokenGraphAppOnly();
+    const remitente = process.env.GRAPH_REMITENTE || 'info@contasult.com';
+    const resp = await fetch(`https://graph.microsoft.com/v1.0/users/${remitente}/sendMail`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            message: {
+                subject: asunto,
+                body: {
+                    contentType: 'HTML',
+                    content: `
+                        <p>${firmanteNombre} ha respondido al presupuesto el ${new Date(fechaFirma).toLocaleString('es-ES')}.</p>
+                        <p><b>Servicios marcados por el cliente:</b></p>
+                        <ul>${lineasHtml}</ul>
+                        <p><b>Total marcado: ${totalAprobado.toFixed(2)} €</b></p>
+                        <p>Firma del cliente:</p>
+                        <img src="cid:firma_cliente" style="max-width:320px; border:1px solid #ccc;">
+                        <p style="margin-top:20px;">Esto todavía <b>no es definitivo</b>: revísalo y confírmalo desde ContaCRM (Facturación → Presupuestos) para que quede aceptado.</p>
+                    `,
+                },
+                toRecipients: destinatarios.map(email => ({ emailAddress: { address: email } })),
+                ccRecipients: (cc || []).map(email => ({ emailAddress: { address: email } })),
+                attachments: [{
+                    '@odata.type': '#microsoft.graph.fileAttachment',
+                    name: 'firma.png', contentType: 'image/png', contentBytes: firmaBase64,
+                    isInline: true, contentId: 'firma_cliente',
+                }],
+            },
+            saveToSentItems: true,
+        }),
+    });
+    if (!resp.ok) throw new Error('Graph sendMail: ' + (await resp.text()));
 }
 
 module.exports = async (req, res) => {
@@ -51,26 +94,15 @@ module.exports = async (req, res) => {
 
         const lineasConAprobacion = presupuesto.lineas.map((l, i) => ({ ...l, aprobada: !!lineasAprobadas[i] }));
         const totalAprobado = lineasConAprobacion.filter(l => l.aprobada).reduce((s, l) => s + l.importe, 0);
-        const algunaAprobada = totalAprobado > 0;
+        const fechaFirma = new Date().toISOString();
 
+        // Firmar nunca es definitivo por sí solo: siempre queda "firmado", a la espera de que
+        // Facturación lo revise y lo confirme (ver confirmarRevision en el frontend).
         await ref.update({
-            estado: algunaAprobada ? 'aceptado' : 'rechazado',
-            lineas_aprobadas: lineasAprobadas,
+            estado: 'firmado', lineas_aprobadas: lineasAprobadas,
             firma_cliente_base64: firmaBase64, firmante_nombre: firmanteNombre,
-            fecha_firma: new Date().toISOString(), fecha_respuesta: new Date().toISOString(),
+            fecha_firma: fechaFirma, fecha_respuesta: fechaFirma,
         });
-
-        if (algunaAprobada) {
-            await db.collection('clientes').doc(String(presupuesto.cliente_id)).update({ estado: 'cliente' });
-            await marcarPasoProtocolo(db, presupuesto.cliente_id, 'p5', 'Presupuesto firmado por el cliente.');
-            const cuotaMensual = lineasConAprobacion.filter(l => l.aprobada && l.periodicidad === 'mensual').reduce((s, l) => s + l.importe, 0);
-            if (cuotaMensual > 0) {
-                const clienteRef = db.collection('clientes').doc(String(presupuesto.cliente_id));
-                const clienteDoc = await clienteRef.get();
-                const fichaActual = (clienteDoc.exists && clienteDoc.data().ficha) || {};
-                await clienteRef.update({ ficha: { ...fichaActual, cuota_mensual: cuotaMensual } });
-            }
-        }
 
         // El usuario solo guarda "departamento_id" (número) en Firestore; el nombre "Facturación"
         // solo existe como texto en la colección "departamentos" — hay que resolverlo primero.
@@ -78,17 +110,34 @@ module.exports = async (req, res) => {
         const usuariosFacturacion = departamentosSnap.empty ? [] : (
             await db.collection('usuarios').where('departamento_id', '==', Number(departamentosSnap.docs[0].id)).get()
         ).docs.map(d => ({ id: Number(d.id), ...d.data() }));
+
         for (const u of usuariosFacturacion) {
             const notifId = await siguienteId(db, 'notificaciones');
             await db.collection('notificaciones').doc(String(notifId)).set({
                 id: notifId, usuario_id: u.id, tipo: 'facturacion',
-                titulo: algunaAprobada ? 'Presupuesto firmado por el cliente' : 'Presupuesto rechazado por el cliente',
-                mensaje: `${firmanteNombre} ha ${algunaAprobada ? `firmado (${totalAprobado.toFixed(2)} €)` : 'rechazado'} el presupuesto #${id}.`,
-                enlace: 'facturacion.html', leido: false, fecha: new Date().toISOString(),
+                titulo: 'Presupuesto firmado, pendiente de revisar',
+                mensaje: `${firmanteNombre} ha marcado ${totalAprobado.toFixed(2)} € en el presupuesto #${id}. Revísalo para confirmarlo.`,
+                enlace: 'facturacion.html', leido: false, fecha: fechaFirma,
             });
         }
 
-        res.status(200).json({ ok: true, estado: algunaAprobada ? 'aceptado' : 'rechazado', totalAprobado });
+        try {
+            const creadorDoc = presupuesto.creado_por ? await db.collection('usuarios').doc(String(presupuesto.creado_por)).get() : null;
+            const destinatarios = [];
+            if (creadorDoc && creadorDoc.exists && creadorDoc.data().email) destinatarios.push(creadorDoc.data().email);
+            const cc = usuariosFacturacion.map(u => u.email).filter(e => e && !destinatarios.includes(e));
+            const lineasHtml = lineasConAprobacion
+                .map(l => `<li>${l.aprobada ? '✅' : '❌'} ${l.servicio} — ${l.importe.toFixed(2)} €</li>`)
+                .join('');
+            await enviarCorreoConfirmacion({
+                destinatarios, cc, asunto: `Presupuesto #${id} firmado por ${firmanteNombre} — pendiente de revisar`,
+                lineasHtml, totalAprobado, firmanteNombre, fechaFirma, firmaBase64,
+            });
+        } catch (err) {
+            console.error('presupuesto-firmar: no se pudo enviar el correo de confirmación:', err.message);
+        }
+
+        res.status(200).json({ ok: true, estado: 'firmado', totalAprobado });
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: 'Error interno.' });
