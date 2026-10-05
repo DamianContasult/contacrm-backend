@@ -83,7 +83,14 @@ module.exports = async (req, res) => {
         const fechaRespuesta = new Date().toISOString();
         await ref.update({
             estado: 'respondido', fecha_respuesta: fechaRespuesta,
-            respuesta: { datos: respuesta, firmante_nombre: firmanteNombre, firma_base64: firmaBase64, pdf_base64: pdfBase64 },
+            respuesta: {
+                datos: respuesta, firmante_nombre: firmanteNombre, firma_base64: firmaBase64, pdf_base64: pdfBase64,
+                evidencia: {
+                    fecha: fechaRespuesta,
+                    ip: (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket?.remoteAddress || null,
+                    user_agent: req.headers['user-agent'] || null,
+                },
+            },
         });
 
         if (envio.creado_por) {
