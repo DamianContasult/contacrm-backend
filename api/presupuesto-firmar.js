@@ -111,13 +111,16 @@ module.exports = async (req, res) => {
             await db.collection('usuarios').where('departamento_id', '==', Number(departamentosSnap.docs[0].id)).get()
         ).docs.map(d => ({ id: Number(d.id), ...d.data() }));
 
-        for (const u of usuariosFacturacion) {
+        // Avisa al técnico que lo creó (HOY) y a Facturación. Un mismo usuario solo recibe un aviso.
+        const destinatariosAviso = new Set(usuariosFacturacion.map(u => u.id));
+        if (presupuesto.creado_por) destinatariosAviso.add(Number(presupuesto.creado_por));
+        for (const usuarioId of destinatariosAviso) {
             const notifId = await siguienteId(db, 'notificaciones');
             await db.collection('notificaciones').doc(String(notifId)).set({
-                id: notifId, usuario_id: u.id, tipo: 'facturacion',
+                id: notifId, usuario_id: usuarioId, tipo: 'facturacion',
                 titulo: 'Presupuesto firmado, pendiente de revisar',
                 mensaje: `${firmanteNombre} ha marcado ${totalAprobado.toFixed(2)} € en el presupuesto #${id}. Revísalo para confirmarlo.`,
-                enlace: 'facturacion.html', leido: false, fecha: fechaFirma,
+                enlace: `facturacion.html?presupuesto=${id}`, leido: false, fecha: fechaFirma,
             });
         }
 
